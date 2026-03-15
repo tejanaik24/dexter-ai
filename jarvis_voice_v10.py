@@ -35,6 +35,8 @@ CHANNELS        = 1
 IN_RATE         = 16000
 OUT_RATE        = 24000
 CHUNK           = 1024
+WAKE_WORDS      = ("dexter", "dextor")
+CONVO_WINDOW_SEC = 25
 MEMORY_FILE     = Path.home() / ".config/jarvis/memory.json"
 LOG_FILE        = Path.home() / "goku/logs/jarvis_voice.log"
 OPENCLAW_MEMORY = Path.home() / ".openclaw/workspace/memory"
@@ -241,9 +243,8 @@ def build_config(mem):
     return types.LiveConnectConfig(
         response_modalities=["AUDIO"],
         system_instruction=system_prompt(mem),
-        # Proactive Audio — Gemini decides when to respond based on context
-        # Only works with v1alpha API (set in client below)
-        proactivity=types.ProactivityConfig(proactive_audio=True),
+        # Strict wake gate: do not let model auto-speak on background speech
+        proactivity=types.ProactivityConfig(proactive_audio=False),
         enable_affective_dialog=True,
         thinking_config=types.ThinkingConfig(thinking_budget=0),
         tools=[
@@ -297,6 +298,9 @@ def build_config(mem):
         ],
         speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
             prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=VOICE))),
+        realtime_input_config=types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(disabled=True)
+        ),
         input_audio_transcription=types.AudioTranscriptionConfig(),
         output_audio_transcription=types.AudioTranscriptionConfig(),
     )
@@ -381,6 +385,19 @@ class Dexter:
         self.sleeping        = False
         self._last_you       = ""
         self._last_dexter    = ""
+        self.wake_window_until = 0.0
+
+    def _has_wake_word(self, text: str) -> bool:
+        tl = text.lower()
+        return any(w in tl for w in WAKE_WORDS)
+
+    def _wake_window_active(self) -> bool:
+        return time.time() < self.wake_window_until
+
+    def _open_wake_window(self):
+        self.wake_window_until = time.time() + CONVO_WINDOW_SEC
+        set_hud("idle")
+        emit_dashboard_event("status", "idle")
 
     async def listen_mic(self):
         self.mic_stream = await asyncio.to_thread(
@@ -407,7 +424,8 @@ class Dexter:
             turn = self.session.receive()
             async for msg in turn:
                 if msg.data:
-                    self.audio_out_queue.put_nowait(msg.data)
+                    if self._wake_window_active() and not self.sleeping:
+                        self.audio_out_queue.put_nowait(msg.data)
 
                 if msg.server_content:
                     sc = msg.server_content
@@ -426,16 +444,21 @@ class Dexter:
                             log.info(f"[YOU]    {t}")
                             emit_dashboard_event("user_speech", t)
                             tl = t.lower()
-                            if any(w in tl for w in ["dexter wake up", "dexter wakeup", "wake up dexter"]):
-                                self.sleeping = False
-                                log.info("Dexter AWAKE")
-                                set_hud("idle")
-                                emit_dashboard_event("status", "idle")
-                            elif any(w in tl for w in ["dexter sleep", "dexter bye", "dexter goodbye", "sleep dexter"]):
+                            if any(w in tl for w in ["dexter sleep", "dexter bye", "dexter goodbye", "sleep dexter"]):
                                 self.sleeping = True
+                                self.wake_window_until = 0.0
                                 log.info("Dexter SLEEPING")
                                 set_hud("idle")
                                 emit_dashboard_event("status", "sleeping")
+                            elif any(w in tl for w in ["dexter wake up", "dexter wakeup", "wake up dexter"]):
+                                self.sleeping = False
+                                self._open_wake_window()
+                                log.info("Dexter AWAKE")
+                            elif not self.sleeping and self._has_wake_word(t):
+                                self._open_wake_window()
+                                log.info("Wake word detected -> 25s conversation window")
+                            elif not self.sleeping and self._wake_window_active():
+                                self._open_wake_window()
 
                     if sc.output_transcription and sc.output_transcription.text:
                         t = sc.output_transcription.text.strip()
@@ -458,6 +481,9 @@ class Dexter:
                         self._last_dexter = ""
 
                 if msg.tool_call:
+                    if not self._wake_window_active() or self.sleeping:
+                        log.info("Ignoring tool call outside wake window")
+                        continue
                     responses = []
                     for fn in msg.tool_call.function_calls:
                         result = do_action(fn.name, dict(fn.args), self.mem)
@@ -493,7 +519,7 @@ class Dexter:
         )
         async with client.aio.live.connect(model=MODEL, config=build_config(self.mem)) as session:
             self.session = session
-            log.info("Dexter v10.2 online. Proactive Audio active. Say 'Dexter' anytime.")
+            log.info("Dexter v10.2 online. Strict wake gate active. Say 'Dexter' anytime.")
             emit_dashboard_event("status", "idle")
             try:
                 async with asyncio.TaskGroup() as tg:
@@ -515,7 +541,7 @@ def main():
         sys.exit(1)
 
     mem = load_memory()
-    log.info(f"Dexter v10.2 | Proactive Audio v1alpha | {len(mem['mistakes'])} mistakes")
+    log.info(f"Dexter v10.2 | Strict wake gate | {len(mem['mistakes'])} mistakes")
 
     hud_script = Path.home() / "Downloads/dexter_hud.py"
     if hud_script.exists():
