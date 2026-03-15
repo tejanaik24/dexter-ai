@@ -48,3 +48,6 @@ You can override paths with environment variables:
 - `DEXTER_FIX_QUEUE_PATH`
 - `DEXTER_DASHBOARD_POLL_MS`
 - `DEXTER_DASHBOARD_MAX_LOG_LINES`
+
+## Project handoff notes
+- Session 28 handoff summary: `docs/session_28_handoff.md`
