@@ -39,6 +39,7 @@ MEMORY_FILE     = Path.home() / ".config/jarvis/memory.json"
 LOG_FILE        = Path.home() / "goku/logs/jarvis_voice.log"
 OPENCLAW_MEMORY = Path.home() / ".openclaw/workspace/memory"
 HUD_STATE_FILE  = Path.home() / ".config/jarvis/hud_state.json"
+DASHBOARD_EVENTS_FILE = Path.home() / ".config/jarvis/dashboard_events.jsonl"
 
 for p in [MEMORY_FILE.parent, LOG_FILE.parent, OPENCLAW_MEMORY]:
     Path(p).mkdir(parents=True, exist_ok=True)
@@ -56,6 +57,15 @@ def set_hud(state, rms=0):
         HUD_STATE_FILE.write_text(json.dumps({"state": state, "rms": int(rms)}))
     except:
         pass
+
+def emit_dashboard_event(event_type, value):
+    try:
+        DASHBOARD_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        event = {"type": event_type, "value": value}
+        with open(DASHBOARD_EVENTS_FILE, "a") as fp:
+            fp.write(json.dumps(event) + "\n")
+    except Exception as e:
+        log.warning(f"Dashboard event write failed: {e}")
 
 def get_daily_memory_file():
     return OPENCLAW_MEMORY / f"{datetime.now().strftime('%Y-%m-%d')}.md"
@@ -295,6 +305,10 @@ def build_config(mem):
 def do_action(name, args, mem):
     global mpv_process
     log.info(f"-> {name}({args})")
+    emit_dashboard_event("current_task", name)
+    emit_dashboard_event("operation_log", f"{name}: {args}")
+    if name == "google_search":
+        emit_dashboard_event("web_search", args)
     try:
         if name == "play_song":
             if mpv_process and mpv_process.poll() is None:
@@ -410,21 +424,25 @@ class Dexter:
                         if t:
                             self._last_you = t
                             log.info(f"[YOU]    {t}")
+                            emit_dashboard_event("user_speech", t)
                             tl = t.lower()
                             if any(w in tl for w in ["dexter wake up", "dexter wakeup", "wake up dexter"]):
                                 self.sleeping = False
                                 log.info("Dexter AWAKE")
                                 set_hud("idle")
+                                emit_dashboard_event("status", "awake")
                             elif any(w in tl for w in ["dexter sleep", "dexter bye", "dexter goodbye", "sleep dexter"]):
                                 self.sleeping = True
                                 log.info("Dexter SLEEPING")
                                 set_hud("idle")
+                                emit_dashboard_event("status", "sleeping")
 
                     if sc.output_transcription and sc.output_transcription.text:
                         t = sc.output_transcription.text.strip()
                         if t:
                             self._last_dexter += " " + t
                             log.info(f"[DEXTER] {t}")
+                            emit_dashboard_event("dexter_speech", t)
 
                     if sc.turn_complete:
                         set_hud("idle")
@@ -473,6 +491,7 @@ class Dexter:
         async with client.aio.live.connect(model=MODEL, config=build_config(self.mem)) as session:
             self.session = session
             log.info("Dexter v10.2 online. Proactive Audio active. Say 'Dexter' anytime.")
+            emit_dashboard_event("status", "idle")
             try:
                 async with asyncio.TaskGroup() as tg:
                     tg.create_task(self.listen_mic())
