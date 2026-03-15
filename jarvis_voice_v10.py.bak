@@ -39,7 +39,6 @@ MEMORY_FILE     = Path.home() / ".config/jarvis/memory.json"
 LOG_FILE        = Path.home() / "goku/logs/jarvis_voice.log"
 OPENCLAW_MEMORY = Path.home() / ".openclaw/workspace/memory"
 HUD_STATE_FILE  = Path.home() / ".config/jarvis/hud_state.json"
-DASHBOARD_EVENTS_FILE = os.path.expanduser("~/.config/jarvis/dashboard_events.jsonl")
 
 for p in [MEMORY_FILE.parent, LOG_FILE.parent, OPENCLAW_MEMORY]:
     Path(p).mkdir(parents=True, exist_ok=True)
@@ -56,14 +55,6 @@ def set_hud(state, rms=0):
     try:
         HUD_STATE_FILE.write_text(json.dumps({"state": state, "rms": int(rms)}))
     except:
-        pass
-
-def emit_dashboard_event(event_type, value):
-    try:
-        os.makedirs(os.path.dirname(DASHBOARD_EVENTS_FILE), exist_ok=True)
-        with open(DASHBOARD_EVENTS_FILE, "a") as f:
-            f.write(json.dumps({"type": event_type, "value": value}) + "\n")
-    except Exception:
         pass
 
 def get_daily_memory_file():
@@ -304,10 +295,6 @@ def build_config(mem):
 def do_action(name, args, mem):
     global mpv_process
     log.info(f"-> {name}({args})")
-    emit_dashboard_event("current_task", name)
-    emit_dashboard_event("operation_log", f"-> {name}({args})")
-    if "search" in name.lower():
-        emit_dashboard_event("web_search", args.get("query", ""))
     try:
         if name == "play_song":
             if mpv_process and mpv_process.poll() is None:
@@ -414,7 +401,6 @@ class Dexter:
                     if sc.interrupted:
                         self.dexter_speaking = False
                         set_hud("idle")
-                        emit_dashboard_event("status", "idle")
                         while not self.audio_out_queue.empty():
                             try: self.audio_out_queue.get_nowait()
                             except: break
@@ -424,29 +410,24 @@ class Dexter:
                         if t:
                             self._last_you = t
                             log.info(f"[YOU]    {t}")
-                            emit_dashboard_event("user_speech", t)
                             tl = t.lower()
                             if any(w in tl for w in ["dexter wake up", "dexter wakeup", "wake up dexter"]):
                                 self.sleeping = False
                                 log.info("Dexter AWAKE")
                                 set_hud("idle")
-                                emit_dashboard_event("status", "idle")
                             elif any(w in tl for w in ["dexter sleep", "dexter bye", "dexter goodbye", "sleep dexter"]):
                                 self.sleeping = True
                                 log.info("Dexter SLEEPING")
                                 set_hud("idle")
-                                emit_dashboard_event("status", "sleeping")
 
                     if sc.output_transcription and sc.output_transcription.text:
                         t = sc.output_transcription.text.strip()
                         if t:
                             self._last_dexter += " " + t
                             log.info(f"[DEXTER] {t}")
-                            emit_dashboard_event("dexter_speech", t)
 
                     if sc.turn_complete:
                         set_hud("idle")
-                        emit_dashboard_event("status", "idle")
                         if self._last_you and self._last_dexter.strip():
                             write_to_shared_memory(self._last_you, self._last_dexter.strip())
                             # Fire learning engine in background — non-blocking
@@ -478,12 +459,10 @@ class Dexter:
             data = await self.audio_out_queue.get()
             self.dexter_speaking = True
             set_hud("speaking")
-            emit_dashboard_event("status", "speaking")
             await asyncio.to_thread(stream.write, data)
             if self.audio_out_queue.empty():
                 self.dexter_speaking = False
                 set_hud("idle")
-                emit_dashboard_event("status", "idle")
 
     async def run(self):
         # v1alpha required for proactive_audio feature
@@ -494,7 +473,6 @@ class Dexter:
         async with client.aio.live.connect(model=MODEL, config=build_config(self.mem)) as session:
             self.session = session
             log.info("Dexter v10.2 online. Proactive Audio active. Say 'Dexter' anytime.")
-            emit_dashboard_event("status", "idle")
             try:
                 async with asyncio.TaskGroup() as tg:
                     tg.create_task(self.listen_mic())
@@ -507,7 +485,6 @@ class Dexter:
                 if self.mic_stream:
                     self.mic_stream.close()
                 set_hud("idle")
-                emit_dashboard_event("status", "idle")
 
 def main():
     if not GEMINI_API_KEY:
