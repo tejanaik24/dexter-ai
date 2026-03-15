@@ -463,6 +463,12 @@ class Dexter:
     def _wake_window_active(self) -> bool:
         return time.time() < self.wake_window_until
 
+    def _response_allowed(self) -> bool:
+        active = self._wake_window_active() and not self.sleeping
+        if not active and self.state["assistant_state"] != "idle":
+            self.state["assistant_state"] = "idle"
+        return active
+
     def _open_wake_window(self):
         self.wake_window_until = time.time() + CONVO_WINDOW_SEC
         self.state["assistant_state"] = "active"
@@ -527,7 +533,7 @@ class Dexter:
             turn = self.session.receive()
             async for msg in turn:
                 if msg.data:
-                    if self._wake_window_active() and not self.sleeping:
+                    if self._response_allowed():
                         self.audio_out_queue.put_nowait(msg.data)
 
                 if msg.server_content:
@@ -566,7 +572,7 @@ class Dexter:
                             elif not self.sleeping:
                                 self.state["assistant_state"] = "idle"
 
-                    if sc.output_transcription and sc.output_transcription.text:
+                    if sc.output_transcription and sc.output_transcription.text and self._response_allowed():
                         t = sc.output_transcription.text.strip()
                         if t:
                             self._last_dexter += " " + t
@@ -587,7 +593,7 @@ class Dexter:
                         self._last_dexter = ""
 
                 if msg.tool_call:
-                    if not self._wake_window_active() or self.sleeping:
+                    if not self._response_allowed():
                         log.info("Ignoring tool call outside wake window")
                         continue
                     responses = []
