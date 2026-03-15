@@ -4,7 +4,8 @@ Dexter v10.2 — Proactive Audio enabled correctly via v1alpha API.
 Gemini only responds when directly addressed as "Dexter".
 No wake word library. No gates. Production grade.
 """
-import asyncio, ctypes, json, logging, os, subprocess, sys, time
+import asyncio, ctypes, json, logging, os, random, re, subprocess, sys, time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -218,16 +219,17 @@ Once activated, keep the conversation going naturally.
 Teja doesn't need to say "Dexter" again mid-conversation.
 Stay in conversation until Teja stops talking or says sleep.
 
-PERSONALITY:
-Sharp, warm, direct like Jarvis from Iron Man.
-Call Teja "sir" occasionally. Keep responses SHORT — 1-2 sentences max.
-Never say "Certainly!" — just act.
-Understand Hinglish, Telugu, English. Always respond in English.
-Adapt instantly — "talk casual" = casual, "be professional" = formal.
+PERSONALITY + RESPONSE POLICY:
+Sharp, warm, concise, loyal, careful.
+Keep responses short and natural (usually 1-2 sentences unless asked for detail).
+Reply in the same language or mixed-language style Teja uses most recently.
+Do not hallucinate actions, results, or facts.
+If intent is unclear or risky, ask exactly one short clarification.
+Continue current task naturally without repetitive filler lines.
 
 WEB SEARCH: Auto-trigger for news, prices, weather, current events.
 
-YOLO MODE — FULL LAPTOP ACCESS. Execute immediately. Never ask for confirmation:
+TOOL BEHAVIOR:
 - "play X" -> play_song(X)
 - "stop music" -> stop_music()
 - "open YouTube" -> open_url("https://youtube.com")
@@ -236,6 +238,8 @@ YOLO MODE — FULL LAPTOP ACCESS. Execute immediately. Never ask for confirmatio
 - "remember X" OR "update my profile" OR "add to pending" OR "save this" OR "note that" -> ALWAYS call update_profile(field, value). NEVER just say you did it. MUST call the tool.
 - "I have a meeting/call/task" -> call update_profile(field="pending", value="...")
 - "someone arriving / event happening" -> call update_profile(field="pending", value="...")
+Never execute destructive/system-risky commands on weak guesses.
+If task details are missing, ask one short clarification then act.
 
 ABOUT TEJA: Fitness entrepreneur, Bangalore. Owns Movement Fitness Centre + VyomaFit. Wife: Ravina.{mistakes}{prefs}{cmds}{context}{profile_str}"""
 
@@ -305,8 +309,54 @@ def build_config(mem):
         output_audio_transcription=types.AudioTranscriptionConfig(),
     )
 
-def do_action(name, args, mem):
+def _is_generic_music_query(query: str) -> bool:
+    q = query.lower().strip()
+    generic_markers = [
+        "play songs", "some songs", "play music", "music", "playlist",
+        "workout", "telugu songs", "hindi songs", "english songs", "mix",
+    ]
+    return len(q.split()) <= 4 or any(m in q for m in generic_markers)
+
+def _pick_music_target(query: str, runtime_state: dict) -> tuple[str, str]:
+    if not _is_generic_music_query(query):
+        return f"ytdl://ytsearch1:{query}", query
+
+    probe_query = f"ytsearch8:{query}"
+    try:
+        proc = subprocess.run(
+            ["yt-dlp", "--flat-playlist", "--print", "%(title)s|||%(id)s", probe_query],
+            capture_output=True, text=True, timeout=12,
+        )
+        candidates = []
+        for line in proc.stdout.splitlines():
+            if "|||" not in line:
+                continue
+            title, vid = line.split("|||", 1)
+            if vid:
+                candidates.append((title.strip() or query, vid.strip()))
+        random.shuffle(candidates)
+        recent = set(runtime_state.get("recent_tracks", []))
+        for title, vid in candidates:
+            if vid not in recent:
+                runtime_state.setdefault("recent_tracks", deque(maxlen=8)).append(vid)
+                return f"ytdl://https://www.youtube.com/watch?v={vid}", title
+        if candidates:
+            title, vid = candidates[0]
+            runtime_state.setdefault("recent_tracks", deque(maxlen=8)).append(vid)
+            return f"ytdl://https://www.youtube.com/watch?v={vid}", title
+    except Exception as e:
+        log.warning(f"Music picker fallback: {e}")
+
+    return f"ytdl://ytsearch1:{query}", query
+
+def _looks_risky_command(command: str) -> bool:
+    c = command.lower()
+    risky = ["rm -rf", "mkfs", "shutdown", "reboot", "dd if=", "chmod -r", "chown -r", ":(){"]
+    return any(x in c for x in risky)
+
+def do_action(name, args, mem, runtime_state=None):
     global mpv_process
+    runtime_state = runtime_state or {}
     log.info(f"-> {name}({args})")
     emit_dashboard_event("current_task", name)
     emit_dashboard_event("operation_log", f"-> {name}({args})")
@@ -317,14 +367,20 @@ def do_action(name, args, mem):
             if mpv_process and mpv_process.poll() is None:
                 mpv_process.terminate()
             query = args.get("query", "")
+            target, chosen_title = _pick_music_target(query, runtime_state)
             mpv_process = subprocess.Popen(
-                ["mpv", f"ytdl://ytsearch1:{query}", "--ytdl-format=best", "--no-video"],
+                ["mpv", target, "--ytdl-format=best", "--no-video"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return f"playing: {query}"
+            runtime_state["media_playing"] = True
+            runtime_state["last_intent"] = "play_song"
+            runtime_state["pending_followup"] = "music"
+            return f"playing: {chosen_title}"
         elif name == "stop_music":
             if mpv_process and mpv_process.poll() is None:
                 mpv_process.terminate()
                 mpv_process = None
+            runtime_state["media_playing"] = False
+            runtime_state["pending_followup"] = ""
             return "stopped"
         elif name == "open_url":
             subprocess.Popen(["xdg-open", args.get("url", "")],
@@ -343,6 +399,8 @@ def do_action(name, args, mem):
         elif name == "run_command":
             cmd = args.get("command", "")
             bg  = args.get("background", False)
+            if _looks_risky_command(cmd):
+                return "I need a quick confirmation for this risky command."
             if bg:
                 subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 return f"running: {cmd}"
@@ -386,18 +444,69 @@ class Dexter:
         self._last_you       = ""
         self._last_dexter    = ""
         self.wake_window_until = 0.0
+        self.state = {
+            "assistant_state": "idle",
+            "conversation_until": 0.0,
+            "last_intent": "",
+            "last_language_style": "",
+            "media_playing": False,
+            "recent_tracks": deque(maxlen=8),
+            "pending_followup": "",
+        }
+        self._ducked_volume = None
 
     def _has_wake_word(self, text: str) -> bool:
-        tl = text.lower()
-        return any(w in tl for w in WAKE_WORDS)
+        tl = text.lower().strip()
+        patterns = [r"^\s*dexter\b", r"\bhey\s+dexter\b", r"\bokay\s+dexter\b", r"\bdexter\s*[,:?.!]", r"\bdextor\b"]
+        return any(re.search(p, tl) for p in patterns)
 
     def _wake_window_active(self) -> bool:
         return time.time() < self.wake_window_until
 
+    def _response_allowed(self) -> bool:
+        active = self._wake_window_active() and not self.sleeping
+        if not active and self.state["assistant_state"] != "idle":
+            self.state["assistant_state"] = "idle"
+        return active
+
     def _open_wake_window(self):
         self.wake_window_until = time.time() + CONVO_WINDOW_SEC
+        self.state["assistant_state"] = "active"
+        self.state["conversation_until"] = self.wake_window_until
         set_hud("idle")
         emit_dashboard_event("status", "idle")
+
+    def _refresh_media_state(self):
+        self.state["media_playing"] = bool(mpv_process and mpv_process.poll() is None)
+
+    def _get_system_volume(self):
+        try:
+            out = subprocess.check_output(["pactl", "get-sink-volume", "@DEFAULT_SINK@"], text=True)
+            m = re.search(r"(\d+)%", out)
+            return int(m.group(1)) if m else None
+        except Exception:
+            return None
+
+    def _set_system_volume(self, value: int):
+        if value is None:
+            return
+        subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{max(1, value)}%"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _duck_if_media_playing(self):
+        self._refresh_media_state()
+        if not self.state["media_playing"] or self._ducked_volume is not None:
+            return
+        current = self._get_system_volume()
+        if current is None:
+            return
+        self._ducked_volume = current
+        self._set_system_volume(max(18, int(current * 0.45)))
+
+    def _restore_ducked_volume(self):
+        if self._ducked_volume is None:
+            return
+        self._set_system_volume(self._ducked_volume)
+        self._ducked_volume = None
 
     async def listen_mic(self):
         self.mic_stream = await asyncio.to_thread(
@@ -424,7 +533,7 @@ class Dexter:
             turn = self.session.receive()
             async for msg in turn:
                 if msg.data:
-                    if self._wake_window_active() and not self.sleeping:
+                    if self._response_allowed():
                         self.audio_out_queue.put_nowait(msg.data)
 
                 if msg.server_content:
@@ -443,6 +552,7 @@ class Dexter:
                             self._last_you = t
                             log.info(f"[YOU]    {t}")
                             emit_dashboard_event("user_speech", t)
+                            self.state["last_language_style"] = t
                             tl = t.lower()
                             if any(w in tl for w in ["dexter sleep", "dexter bye", "dexter goodbye", "sleep dexter"]):
                                 self.sleeping = True
@@ -459,8 +569,10 @@ class Dexter:
                                 log.info("Wake word detected -> 25s conversation window")
                             elif not self.sleeping and self._wake_window_active():
                                 self._open_wake_window()
+                            elif not self.sleeping:
+                                self.state["assistant_state"] = "idle"
 
-                    if sc.output_transcription and sc.output_transcription.text:
+                    if sc.output_transcription and sc.output_transcription.text and self._response_allowed():
                         t = sc.output_transcription.text.strip()
                         if t:
                             self._last_dexter += " " + t
@@ -481,12 +593,12 @@ class Dexter:
                         self._last_dexter = ""
 
                 if msg.tool_call:
-                    if not self._wake_window_active() or self.sleeping:
+                    if not self._response_allowed():
                         log.info("Ignoring tool call outside wake window")
                         continue
                     responses = []
                     for fn in msg.tool_call.function_calls:
-                        result = do_action(fn.name, dict(fn.args), self.mem)
+                        result = do_action(fn.name, dict(fn.args), self.mem, self.state)
                         responses.append(types.FunctionResponse(
                             id=fn.id, name=fn.name, response={"result": result}))
                     await self.session.send_tool_response(function_responses=responses)
@@ -502,12 +614,14 @@ class Dexter:
         )
         while True:
             data = await self.audio_out_queue.get()
+            self._duck_if_media_playing()
             self.dexter_speaking = True
             set_hud("speaking")
             emit_dashboard_event("status", "speaking")
             await asyncio.to_thread(stream.write, data)
             if self.audio_out_queue.empty():
                 self.dexter_speaking = False
+                self._restore_ducked_volume()
                 set_hud("idle")
                 emit_dashboard_event("status", "idle")
 
